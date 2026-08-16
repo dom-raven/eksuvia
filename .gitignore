@@ -1,7 +1,11 @@
-# Build output
+# Build output.
+#
+# The binary pattern is anchored with a leading slash on purpose: a bare
+# "eksuvia" matches any path segment with that name, which silently excludes
+# cmd/eksuvia/ and ships a repo that cannot be built.
 /bin/
 /dist/
-eksuvia
+/eksuvia
 
 # Local state: per-cluster signing keys and webhook configs.
 # These must never be committed.
