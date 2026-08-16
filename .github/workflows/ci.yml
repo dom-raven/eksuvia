@@ -47,6 +47,16 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+      # The initial commit shipped without cmd/eksuvia because a bare
+      # "eksuvia" gitignore pattern matched the directory. `go build ./...`
+      # did not catch it, because it runs against a working tree that still
+      # had the file. Build from the tracked files only.
+      - name: tracked files alone must build
+        run: |
+          mkdir -p /tmp/tracked
+          git ls-files | tar -cf - -T - | tar -xf - -C /tmp/tracked
+          cd /tmp/tracked && go build ./... && go test ./...
+
   # Provisioning needs a container runtime, so it is a separate job. It is
   # allowed to fail for now: end-to-end verification is the top roadmap item
   # and this job exists to make progress on it visible rather than to gate PRs.
@@ -54,6 +64,7 @@ jobs:
     name: end-to-end smoke (informational)
     runs-on: ubuntu-latest
     continue-on-error: true
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -67,21 +78,25 @@ jobs:
 
       - name: start eksuvia
         run: |
-          # No Floci here yet, so only the paths eksuvia serves itself are
-          # exercised. The Docker bridge gateway stands in for
-          # host.docker.internal, which Linux runners do not resolve.
-          ./bin/eksuvia \
-            --listen 127.0.0.1:4566 \
+          # Bind all interfaces, not loopback: the kind API server runs in a
+          # container and reaches the TokenReview webhook over the bridge
+          # gateway, which a 127.0.0.1 listener would refuse.
+          #
+          # No Floci here, so only the surface eksuvia serves itself is
+          # exercised; STS-backed authentication is not.
+          nohup ./bin/eksuvia \
+            --listen 0.0.0.0:4566 \
             --floci-endpoint http://127.0.0.1:4599 \
             --advertise-host 172.17.0.1 \
-            --log-level debug &
+            --log-level debug > eksuvia.log 2>&1 &
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:4566/_eksuvia/health && break
             sleep 1
           done
 
-      - name: health and catalogue respond
+      - name: API surface responds
         run: |
+          set -x
           curl -sf http://127.0.0.1:4566/_eksuvia/health
           curl -sf http://127.0.0.1:4566/access-policies
           curl -sf "http://127.0.0.1:4566/addons/supported-versions?addonName=coredns"
@@ -91,15 +106,56 @@ jobs:
           curl -sf -X POST http://127.0.0.1:4566/clusters \
             -H 'Content-Type: application/json' \
             -d '{"name":"ci","roleArn":"arn:aws:iam::000000000000:role/eksClusterRole","version":"1.31"}'
-          # Poll for ACTIVE. This is the step that currently proves nothing is
-          # verified end to end; when it passes reliably, drop continue-on-error.
-          for _ in $(seq 1 60); do
+          for _ in $(seq 1 90); do
             status=$(curl -sf http://127.0.0.1:4566/clusters/ci | grep -o '"status":"[A-Z]*"' || true)
             echo "status: $status"
             case "$status" in
-              *ACTIVE*) exit 0 ;;
-              *FAILED*) exit 1 ;;
+              *ACTIVE*) echo "cluster reached ACTIVE"; exit 0 ;;
+              *FAILED*) echo "cluster FAILED"; exit 1 ;;
             esac
             sleep 10
           done
+          echo "timed out waiting for ACTIVE"
           exit 1
+
+      - name: kubectl reaches the cluster
+        run: |
+          # Uses kind's admin kubeconfig, which authenticates by client
+          # certificate. The IAM path needs Floci's STS and is not covered here.
+          kind export kubeconfig --name eksuvia-ci
+          kubectl get nodes -o wide
+          kubectl get pods -A
+
+      # Everything below runs even when the steps above fail: this job exists
+      # to produce a diagnosis, and a bare "exit 1" is not one.
+      - name: diagnostics
+        if: always()
+        run: |
+          echo "===== eksuvia log ====="
+          cat eksuvia.log || true
+          echo "===== containers ====="
+          docker ps -a || true
+          echo "===== kind clusters ====="
+          kind get clusters || true
+          echo "===== control-plane container log (tail) ====="
+          docker logs --tail 120 eksuvia-ci-control-plane 2>&1 || true
+          echo "===== static pod manifest: kube-apiserver ====="
+          docker exec eksuvia-ci-control-plane cat /etc/kubernetes/manifests/kube-apiserver.yaml 2>&1 || true
+          echo "===== assets visible on the node ====="
+          docker exec eksuvia-ci-control-plane ls -la /etc/eksuvia 2>&1 || true
+          echo "===== kubelet log (tail) ====="
+          docker exec eksuvia-ci-control-plane journalctl -u kubelet --no-pager -n 80 2>&1 || true
+
+      - name: export kind logs
+        if: always()
+        run: kind export logs ./kind-logs --name eksuvia-ci || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-diagnostics
+          path: |
+            eksuvia.log
+            kind-logs/
+          if-no-files-found: ignore
+          retention-days: 7

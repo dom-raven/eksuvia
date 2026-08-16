@@ -334,14 +334,38 @@ func kubeadmPatches(spec Spec) []string {
 // clusterConfigPatch renders a ClusterConfiguration merge patch. listStyle
 // selects the v1beta4 extraArgs encoding, which is a list of name/value pairs
 // rather than a map.
+//
+// extraVolumes is as important as extraArgs and easy to forget: kube-apiserver
+// and kube-controller-manager run as *static pods*, so a file that exists on
+// the node is invisible to them unless kubeadm is told to mount it. Without
+// this, the API server starts with --service-account-signing-key-file pointing
+// at a path that does not exist inside its container, crash-loops, and kubeadm
+// eventually times out waiting for a control plane that will never be healthy.
 func clusterConfigPatch(apiVersion string, apiServerArgs, cmArgs [][2]string, listStyle bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "apiVersion: %s\nkind: ClusterConfiguration\n", apiVersion)
+
 	b.WriteString("apiServer:\n  extraArgs:\n")
 	writeArgs(&b, apiServerArgs, listStyle, "    ")
+	writeExtraVolumes(&b)
+
 	b.WriteString("controllerManager:\n  extraArgs:\n")
 	writeArgs(&b, cmArgs, listStyle, "    ")
+	writeExtraVolumes(&b)
+
 	return b.String()
+}
+
+// writeExtraVolumes mounts the eksuvia assets directory into a control-plane
+// static pod. The shape is identical in kubeadm v1beta3 and v1beta4.
+func writeExtraVolumes(b *strings.Builder) {
+	fmt.Fprintf(b, `  extraVolumes:
+    - name: eksuvia
+      hostPath: %s
+      mountPath: %s
+      readOnly: true
+      pathType: DirectoryOrCreate
+`, AssetsMountPath, AssetsMountPath)
 }
 
 func writeArgs(b *strings.Builder, args [][2]string, listStyle bool, indent string) {
