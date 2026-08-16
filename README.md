@@ -4,6 +4,7 @@
 
 **Run Amazon EKS locally.** A high-fidelity local EKS emulator: real upstream Kubernetes via [kind](https://kind.sigs.k8s.io/), real AWS APIs via [Floci](https://github.com/floci-io/floci), and the *hidden* EKS control plane emulated in between.
 
+[![CI](https://github.com/dom-raven/eksuvia/actions/workflows/ci.yml/badge.svg)](https://github.com/dom-raven/eksuvia/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/go-1.24%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Status: early](https://img.shields.io/badge/status-early-orange.svg)](#project-status)
@@ -168,9 +169,31 @@ Every flag has an `EKSUVIA_`-prefixed environment variable.
 
 ## Project status
 
-**Early. Honest about it.**
+**Early, but the core is verified on real infrastructure.**
 
-The Go core compiles cleanly, passes `go vet` and `go test -race`, and the fidelity-critical packages are covered at **85–89%**:
+Every push runs a CI job that stands up an actual kind cluster and asserts the emulation holds. As of the latest run:
+
+```
+✔ cluster reached ACTIVE
+✔ all EKS control-plane flags present in the generated kube-apiserver manifest
+✔ service-account tokens verify against the injected signing key   (CoreDNS Ready)
+
+NAME                       STATUS   VERSION   NODEGROUP   INSTANCE-TYPE   ZONE
+eksuvia-ci-control-plane   Ready    v1.31.0
+eksuvia-ci-worker          Ready    v1.31.0   workers     t3.medium       us-east-1a
+eksuvia-ci-worker2         Ready    v1.31.0   workers     t3.medium       us-east-1a
+
+✔ kubectl auth can-i list pods   --as arn:aws:iam::…:role/Developer  → yes
+✔ kubectl auth can-i delete pods --as arn:aws:iam::…:role/Developer  → no
+```
+
+That last pair is the one that matters. `AmazonEKSViewPolicy` was associated through the EKS API, reconciled into a real `ClusterRoleBinding`, and is **enforced** — it grants read and refuses delete. That is the difference between recording a policy and honouring one.
+
+CoreDNS reaching Ready is also load-bearing evidence: it authenticates with a service-account token, so it only starts if the API server accepts tokens signed by the key eksuvia injected at bootstrap.
+
+**What is still unverified:** the IAM token webhook round trip and in-pod IRSA, both of which need Floci's STS in the loop. The CI job runs eksuvia standalone, so `aws eks get-token` authentication has been unit-tested but not exercised against a live cluster.
+
+The Go core passes `go vet` and `go test -race`, and the fidelity-critical packages are covered at **85–89%**:
 
 | Package | What it does | Coverage |
 |---|---|---|
@@ -180,18 +203,21 @@ The Go core compiles cleanly, passes `go vet` and `go test -race`, and the fidel
 | `oidc` | signing keys, JWKS, IRSA tokens | 85.7% |
 | `token` | `k8s-aws-v1` verification | 84.7% |
 
-The **HTTP surface has been exercised against the running binary**: cluster CRUD, access entries (including URL-encoded and assumed-role ARNs), access-policy association, the TokenReview webhook's denial path, OIDC discovery and JWKS, IRSA token minting with a matching `kid`, `405` handling, and proxy fallback. Two real bugs were found and fixed that way — a nested ARN in `accessEntryArn`, and a stray `spec` echoed in webhook replies.
+The HTTP surface was also exercised directly against the running binary, which caught two real bugs — a nested ARN in `accessEntryArn`, and a stray `spec` echoed in webhook replies. A third, worse one showed up only in CI: `kube-apiserver` runs as a static pod, so the injected signing key was invisible to it until the kubeadm patch grew an `extraVolumes` entry. Every cluster creation timed out until that was fixed, and there is now a regression test for it.
 
-**What has not been run is anything requiring Docker.** It was developed on a machine without a container runtime, so cluster provisioning — the kubeadm patches, the webhook round trip from inside a kind node, node labelling — is *unverified against a live cluster*. Expect rough edges on first run. If you hit one, an issue with the log output is genuinely useful.
+Expect rough edges away from the tested path — Podman, Docker Desktop on macOS/Windows, and Kubernetes versions other than 1.31 are all unexercised. If you hit one, an issue with the log output is genuinely useful.
 
 | Area | State |
 |---|---|
-| Cluster CRUD, node groups, access entries, add-on API | implemented |
-| IAM token webhook → RBAC mapping | implemented |
-| OIDC discovery / JWKS / IRSA wiring | implemented |
+| Cluster CRUD, kind provisioning, kubeadm patching | implemented, **verified in CI** |
+| Node groups backed by real labelled nodes | implemented, **verified in CI** |
+| Access entries + policies → enforced RBAC | implemented, **verified in CI** |
+| OIDC signing key accepted by the API server | implemented, **verified in CI** |
+| IAM token webhook → RBAC mapping | implemented, unit-tested; needs Floci to verify live |
+| In-pod IRSA (`AssumeRoleWithWebIdentity`) | wired; needs Floci to verify live |
+| Add-on API and catalogue | implemented; installation is partial |
 | Proxy to Floci for all other AWS services | implemented |
-| End-to-end verification against Docker | **not done** |
-| EKS Pod Identity, Fargate profiles, cloud controller (ELBv2/EBS), add-on installation | [roadmap](docs/roadmap.md) |
+| EKS Pod Identity, Fargate, cloud controller (ELBv2/EBS), IRSA admission webhook | [roadmap](docs/roadmap.md) |
 
 See **[docs/fidelity.md](docs/fidelity.md)** for a blunt account of what is faithful, what is approximated, and what is missing — including the deliberate deviations and why they were made.
 

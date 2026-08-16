@@ -4,9 +4,9 @@ Thanks for looking. eksuvia is early, and the most useful contributions right no
 
 ## The highest-value thing you can do
 
-**Run it against real Docker and tell us what breaks.**
+**Run it somewhere CI does not, and tell us what breaks.**
 
-The core was written on a machine without a container runtime, so cluster provisioning has never actually executed. If you run the quick start and hit a wall, an issue containing:
+CI verifies the core against a real kind cluster on Ubuntu with Docker and Kubernetes 1.31. Everything outside that — Podman, Docker Desktop on macOS or Windows, other Kubernetes versions — is unexercised. If you run the quick start and hit a wall, an issue containing:
 
 - your OS and container runtime (Docker Desktop / Docker Engine / Podman)
 - the `--advertise-host` you used

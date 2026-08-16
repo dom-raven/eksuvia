@@ -2,16 +2,25 @@
 
 Ordered roughly by value per unit of effort. Nothing here is scheduled; this is a list of what would make eksuvia meaningfully better, and it is where to look if you want to contribute.
 
-## 0. Verify it end to end
+## 0. Finish end-to-end verification
 
-**The single most valuable thing right now.** The core was written on a machine without Docker, so cluster provisioning has never been executed. Specifically unverified:
+CI now stands up a real kind cluster on every push and asserts the control-plane
+flags, the injected signing key, node group labelling, and RBAC enforcement.
+What that job does *not* cover, because it runs eksuvia without Floci:
 
-- Do the kubeadm patches apply cleanly across Kubernetes 1.29–1.32? (The v1beta3/v1beta4 dual-patch trick is reasoned-through but untested.)
-- Can the API server inside the kind node actually reach the token webhook, on Docker Desktop *and* on plain Linux?
-- Does the control-plane node accept a bind-mounted service-account signing key, given the API server runs as non-root?
-- Does `aws eks update-kubeconfig` + `kubectl get nodes` complete the full loop?
+- **The IAM token webhook round trip.** `aws eks get-token` → TokenReview →
+  STS → ARN → RBAC has thorough unit tests but has never run against a live
+  cluster. Needs Floci in the CI job, and its STS reachable from the kind node.
+- **In-pod IRSA.** The signing key demonstrably works (CoreDNS authenticates
+  with it), but no pod has yet completed `AssumeRoleWithWebIdentity` against
+  Floci's STS.
+- **Anything but Ubuntu + Docker + Kubernetes 1.31.** Podman, Docker Desktop on
+  macOS and Windows, and other Kubernetes versions are all untested. The
+  `--advertise-host` default (`host.docker.internal`) is the most likely thing
+  to break on plain Linux.
 
-Running this and reporting the failures — with logs — is worth more than any new feature.
+Reports from those environments — with `--log-level debug` output — are worth
+more than any new feature.
 
 ## 1. The IRSA mutating webhook
 
