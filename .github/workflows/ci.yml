@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: build, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      - name: test
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  # Provisioning needs a container runtime, so it is a separate job. It is
+  # allowed to fail for now: end-to-end verification is the top roadmap item
+  # and this job exists to make progress on it visible rather than to gate PRs.
+  smoke:
+    name: end-to-end smoke (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: build
+        run: go build -o bin/eksuvia ./cmd/eksuvia
+
+      - name: start eksuvia
+        run: |
+          # No Floci here yet, so only the paths eksuvia serves itself are
+          # exercised. The Docker bridge gateway stands in for
+          # host.docker.internal, which Linux runners do not resolve.
+          ./bin/eksuvia \
+            --listen 127.0.0.1:4566 \
+            --floci-endpoint http://127.0.0.1:4599 \
+            --advertise-host 172.17.0.1 \
+            --log-level debug &
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:4566/_eksuvia/health && break
+            sleep 1
+          done
+
+      - name: health and catalogue respond
+        run: |
+          curl -sf http://127.0.0.1:4566/_eksuvia/health
+          curl -sf http://127.0.0.1:4566/access-policies
+          curl -sf "http://127.0.0.1:4566/addons/supported-versions?addonName=coredns"
+
+      - name: create a cluster end to end
+        run: |
+          curl -sf -X POST http://127.0.0.1:4566/clusters \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"ci","roleArn":"arn:aws:iam::000000000000:role/eksClusterRole","version":"1.31"}'
+          # Poll for ACTIVE. This is the step that currently proves nothing is
+          # verified end to end; when it passes reliably, drop continue-on-error.
+          for _ in $(seq 1 60); do
+            status=$(curl -sf http://127.0.0.1:4566/clusters/ci | grep -o '"status":"[A-Z]*"' || true)
+            echo "status: $status"
+            case "$status" in
+              *ACTIVE*) exit 0 ;;
+              *FAILED*) exit 1 ;;
+            esac
+            sleep 10
+          done
+          exit 1

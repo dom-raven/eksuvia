@@ -1,0 +1,21 @@
+# Build output
+/bin/
+/dist/
+eksuvia
+
+# Local state: per-cluster signing keys and webhook configs.
+# These must never be committed.
+/.eksuvia/
+*.pem
+sa.key
+sa.pub
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

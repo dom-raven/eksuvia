@@ -1,0 +1,68 @@
+# eksuvia + Floci: a complete local AWS, with EKS that behaves like EKS.
+#
+#   docker compose up -d
+#   export AWS_ENDPOINT_URL=http://localhost:4566
+#
+# eksuvia is the single front door on 4566. It serves the EKS control plane
+# itself and proxies every other AWS service to Floci, which stays on the
+# internal network.
+
+services:
+  eksuvia:
+    build:
+      context: .
+      args:
+        VERSION: ${EKSUVIA_VERSION:-dev}
+    # image: ghcr.io/dom-raven/eksuvia:latest   # once published
+    ports:
+      - "4566:4566"
+    environment:
+      EKSUVIA_FLOCI_ENDPOINT: http://floci:4566
+
+      # How the kind API server and Floci reach eksuvia. Neither can use
+      # "localhost" -- that resolves to their own container.
+      #
+      # On Docker Desktop (macOS/Windows) host.docker.internal works as-is.
+      # On plain Linux it is usually NOT resolvable: set this to your Docker
+      # bridge gateway, commonly 172.17.0.1. This is the most likely thing to
+      # need changing.
+      EKSUVIA_ADVERTISE_HOST: ${EKSUVIA_ADVERTISE_HOST:-host.docker.internal}
+
+      # Must match the volume mount below on BOTH sides. eksuvia writes each
+      # cluster's signing key here and then asks the runtime to bind-mount that
+      # path into the kind node -- and the runtime resolves it against the
+      # host, not against this container. If the two paths differ, the node
+      # gets an empty mount and the API server fails to start.
+      EKSUVIA_STATE_DIR: ${HOME}/.eksuvia
+
+      EKSUVIA_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      EKSUVIA_ACCOUNT_ID: "000000000000"
+      EKSUVIA_WORKER_POOL_SIZE: "2"
+      EKSUVIA_LOG_LEVEL: ${EKSUVIA_LOG_LEVEL:-info}
+    volumes:
+      # Required: eksuvia drives the container runtime to create kind clusters.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Per-cluster signing keys and webhook configs. These are bind-mounted
+      # into the kind control-plane node, so the path must be identical on the
+      # host and inside this container -- the runtime resolves it host-side.
+      - ${HOME}/.eksuvia:${HOME}/.eksuvia
+    extra_hosts:
+      # Makes host.docker.internal resolvable on Linux too.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - floci
+    restart: unless-stopped
+
+  floci:
+    image: floci/floci:latest
+    # Deliberately not published on the host: eksuvia is the front door, and
+    # exposing both invites pointing AWS_ENDPOINT_URL at the wrong one.
+    expose:
+      - "4566"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Floci ships its own k3s-backed EKS. eksuvia owns the EKS surface here,
+      # so turn Floci's off to make the routing unambiguous.
+      FLOCI_SERVICES_EKS_ENABLED: "false"
+    restart: unless-stopped

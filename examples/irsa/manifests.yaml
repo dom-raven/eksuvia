@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: s3-reader
+  namespace: default
+  annotations:
+    # On real EKS this annotation is all you need: the pod identity webhook
+    # reads it and injects everything below. eksuvia does not run that webhook
+    # yet, so the pod spec sets the variables explicitly. Keeping the
+    # annotation means this file also works unchanged against real EKS.
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/S3Reader
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: irsa-demo
+  namespace: default
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      serviceAccountName: s3-reader
+      restartPolicy: Never
+      containers:
+        - name: aws
+          image: amazon/aws-cli:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "--- who am I? ---"
+              # No static credentials anywhere. The SDK reads the projected
+              # token and exchanges it via AssumeRoleWithWebIdentity.
+              aws sts get-caller-identity
+              echo "--- list buckets ---"
+              aws s3 ls
+          env:
+            # Point the CLI at the local emulator rather than real AWS.
+            - name: AWS_ENDPOINT_URL
+              value: http://host.docker.internal:4566
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+
+            # Injected automatically by the pod identity webhook on real EKS.
+            - name: AWS_ROLE_ARN
+              value: arn:aws:iam::000000000000:role/S3Reader
+            - name: AWS_WEB_IDENTITY_TOKEN_FILE
+              value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+          volumeMounts:
+            - name: aws-iam-token
+              mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+              readOnly: true
+      volumes:
+        - name: aws-iam-token
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  # The kubelet mints this token and rotates it. It is signed
+                  # with the key eksuvia handed to the API server, so STS can
+                  # verify it against the cluster's published JWKS.
+                  path: token
+                  # This audience is what makes it an IRSA token rather than an
+                  # ordinary in-cluster one.
+                  audience: sts.amazonaws.com
+                  expirationSeconds: 86400
