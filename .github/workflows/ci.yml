@@ -126,6 +126,59 @@ jobs:
           kubectl get nodes -o wide
           kubectl get pods -A
 
+      - name: control plane carries the EKS wiring
+        run: |
+          set -e
+          manifest=$(docker exec eksuvia-ci-control-plane cat /etc/kubernetes/manifests/kube-apiserver.yaml)
+          for flag in service-account-issuer service-account-signing-key-file \
+                      authentication-token-webhook-config-file api-audiences; do
+            echo "$manifest" | grep -q -- "--$flag" || { echo "MISSING: --$flag"; exit 1; }
+          done
+          echo "all EKS control-plane flags present"
+
+          # CoreDNS and kube-proxy running at all proves the API server accepts
+          # service-account tokens signed by the key eksuvia injected. If the
+          # key had not taken effect they would fail to authenticate.
+          kubectl -n kube-system wait --for=condition=Ready pod -l k8s-app=kube-dns --timeout=120s
+          echo "service-account tokens verify against the injected signing key"
+
+      - name: node group claims and labels real nodes
+        run: |
+          set -e
+          curl -sf -X POST http://127.0.0.1:4566/clusters/ci/node-groups \
+            -H 'Content-Type: application/json' \
+            -d '{"nodegroupName":"workers","nodeRole":"arn:aws:iam::000000000000:role/eksNodeRole",
+                 "instanceTypes":["t3.medium"],"scalingConfig":{"minSize":1,"maxSize":3,"desiredSize":2}}'
+          for _ in $(seq 1 30); do
+            status=$(curl -sf http://127.0.0.1:4566/clusters/ci/node-groups/workers | grep -o '"status":"[A-Z_]*"' || true)
+            echo "nodegroup: $status"
+            case "$status" in *ACTIVE*) break ;; *CREATE_FAILED*) exit 1 ;; esac
+            sleep 5
+          done
+          kubectl get nodes -L eks.amazonaws.com/nodegroup,node.kubernetes.io/instance-type,topology.kubernetes.io/zone
+          # Both pool workers should now carry the node group label.
+          labelled=$(kubectl get nodes -l eks.amazonaws.com/nodegroup=workers --no-headers | wc -l)
+          echo "nodes labelled: $labelled"
+          [ "$labelled" -eq 2 ] || { echo "expected 2 labelled nodes"; exit 1; }
+
+      - name: access policies reconcile into real RBAC
+        run: |
+          set -e
+          arn='arn:aws:iam::000000000000:role/Developer'
+          enc=$(python3 -c "import urllib.parse;print(urllib.parse.quote('$arn',safe=''))")
+          curl -sf -X POST http://127.0.0.1:4566/clusters/ci/access-entries \
+            -H 'Content-Type: application/json' -d "{\"principalArn\":\"$arn\"}"
+          curl -sf -X POST "http://127.0.0.1:4566/clusters/ci/access-entries/$enc/access-policies" \
+            -H 'Content-Type: application/json' \
+            -d '{"policyArn":"arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy",
+                 "accessScope":{"type":"cluster"}}'
+          sleep 3
+          kubectl get clusterrolebindings -l eksuvia.dev/managed-by=eksuvia -o wide
+          # The grant must be real, not just recorded in the API.
+          kubectl auth can-i list pods --as "$arn" -A
+          kubectl auth can-i delete pods --as "$arn" -A && { echo "view policy granted delete"; exit 1; } || true
+          echo "access policy enforced by RBAC"
+
       # Everything below runs even when the steps above fail: this job exists
       # to produce a diagnosis, and a bare "exit 1" is not one.
       - name: diagnostics
